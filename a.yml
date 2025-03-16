@@ -1,0 +1,232 @@
+---
+- name: Playbook for Project Deployment
+  hosts: localhost
+  tasks:
+
+    # Install MySQL repository
+    - name: Download and Install MySQL repository
+      yum:
+        name: https://repo.mysql.com/mysql84-community-release-el9-1.noarch.rpm
+        state: present
+        disable_gpg_check: yes
+
+    # Install MySQL Server
+    - name: Install MySQL server
+      yum:
+        name: mysql-community-server
+        state: present
+
+    # Install Python and MySQL dependencies
+    - name: Install Python and MySQL Python dependency
+      yum:
+        name: python3-pip
+        state: present
+
+    - name: Install PyMySQL for MySQL Ansible modules
+      pip:
+        name: PyMySQL
+        executable: pip3
+
+    # Enable and Start MySQL
+    - name: Enable and start MySQL
+      systemd:
+        name: mysqld
+        enabled: yes
+        state: started
+
+    # Get MySQL temporary root password
+    - name: Get MySQL temporary root password
+      shell: grep 'temporary password' /var/log/mysqld.log | awk '{print $NF}'
+      register: mysql_temp_password
+      changed_when: false
+
+    # Set new MySQL root password
+    - name: Change MySQL root password
+      shell: >
+        mysql --connect-expired-password -uroot -p"{{ mysql_temp_password.stdout }}"
+        -e "ALTER USER 'root'@'localhost' IDENTIFIED BY 'Ansible#1';"
+      ignore_errors: yes
+
+    # Create ~/.my.cnf for root authentication
+    - name: Create ~/.my.cnf for root user
+      copy:
+        dest: /root/.my.cnf
+        content: |
+          [client]
+          user=root
+          password=Ansible#1
+        mode: '0600'
+
+    # Install PHP and extensions
+    - name: Install PHP and required extensions
+      yum:
+        name:
+          - php
+          - php-fpm
+          - php-mysqlnd
+          - php-cli
+          - php-common
+          - php-json
+          - php-opcache
+          - php-mbstring
+          - php-xml
+          - php-curl
+        state: present
+
+    - name: Enable and start PHP-FPM
+      service:
+        name: php-fpm
+        state: started
+        enabled: yes
+
+    # Install and configure Nginx
+    - name: Install Nginx
+      yum:
+        name: nginx
+        state: present
+
+    - name: Enable and start Nginx
+      service:
+        name: nginx
+        enabled: yes
+        state: started
+
+    # Create project user
+    - name: Create project user
+      user:
+        name: project
+        password: "{{ 'project' | password_hash('sha512') }}"
+
+    # Create project directory structure
+    - name: Create project directory structure
+      file:
+        path: /home/project/project/public
+        state: directory
+        owner: project
+        group: project
+        mode: '0755'
+        recurse: yes
+
+    # Enable SELinux HTTP home directory access
+    - name: Enable SELinux HTTP home directory access
+      seboolean:
+        name: httpd_enable_homedirs
+        state: yes
+        persistent: yes
+
+    # Configure Nginx for Project
+    - name: Configure Nginx project site
+      template:
+        src: project.conf.j2
+        dest: /etc/nginx/conf.d/project.conf
+
+    - name: Restart Nginx and PHP-FPM
+      service:
+        name: "{{ item }}"
+        state: restarted
+      loop:
+        - nginx
+        - php-fpm
+
+    # Configure SFTP access
+    - name: Configure SFTP access
+      template:
+        src: sftp.conf.j2
+        dest: /etc/ssh/sshd_config.d/sftp.conf
+
+    - name: Restart SSH service
+      systemd:
+        name: sshd
+        state: restarted
+
+    - name: Create SFTP user group and assign project user
+      group:
+        name: sftpusers
+        state: present
+
+    - name: Add project user to sftpusers group
+      user:
+        name: project
+        groups: sftpusers
+        append: yes
+
+    - name: Set permissions for SFTP directories
+      file:
+        path: /home/project
+        state: directory
+        owner: root
+        group: sftpusers
+        mode: '0755'
+
+    - name: Set permissions for project public directory
+      file:
+        path: /home/project/project/public
+        state: directory
+        owner: project
+        group: sftpusers
+        mode: '0755'
+
+    # Install phpMyAdmin
+    - name: Download and extract phpMyAdmin
+      unarchive:
+        src: https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.tar.gz
+        dest: /home/project/project/public/
+        remote_src: yes
+        extra_opts:
+          - --strip-components=1
+        creates: /home/project/project/public/phpmyadmin
+
+    - name: Configure Nginx for phpMyAdmin
+      template:
+        src: phpmyadmin.conf.j2
+        dest: /etc/nginx/conf.d/phpmyadmin.conf
+
+    - name: Restart Nginx
+      systemd:
+        name: nginx
+        state: restarted
+
+    # Install WordPress
+    - name: Download and extract WordPress
+      unarchive:
+        src: https://wordpress.org/latest.tar.gz
+        dest: /home/project/project/public/
+        remote_src: yes
+        extra_opts:
+          - --strip-components=1
+        creates: /home/project/project/public/wp-config-sample.php
+
+    # Create MySQL Database & User
+    - name: Configure MySQL database and user
+      community.mysql.mysql_db:
+        login_user: root
+        login_password: "Ansible#1"
+        name: wordpress
+        state: present
+
+    - name: Create WordPress user in MySQL
+      community.mysql.mysql_user:
+        name: wpuser
+        password: WPUser#1
+        priv: 'wordpress.*:ALL'
+        host: localhost
+        state: present
+
+    - name: Restart Nginx
+      systemd:
+        name: nginx
+        state: restarted
+
+    # Generate wp-config.php
+    - name: Generate wp-config.php
+      template:
+        src: wp-config.php.j2
+        dest: /home/project/project/public/wp-config.php
+
+    # Check WordPress Installation Page
+    - name: Check if WordPress install page is accessible
+      uri:
+        url: "http://{{ ansible_default_ipv4.address }}/wp-admin/install.php"
+        method: GET
+        return_content: yes
+
