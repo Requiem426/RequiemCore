@@ -1,0 +1,343 @@
+- name: Dynamic playbook for project setup
+  hosts: localhost  # Can be overridden with -i or inventory
+  connection: local  # Can be adjusted for remote hosts
+  become: yes       # Ensures root privileges
+  vars:
+    # Project-specific variables
+    project_user: project
+    project_base_dir: "/home/{{ project_user }}"
+    project_public_dir: "{{ project_base_dir }}/project/public"
+    sftp_group: sftpusers
+
+    # MySQL variables
+    mysql_root_password: "{{ lookup('env', 'MYSQL_ROOT_PASSWORD') | default('Ansible#1', true) }}"
+    mysql_wp_db: wordpress
+    mysql_wp_user: wpuser
+    mysql_wp_password: "{{ lookup('env', 'MYSQL_WP_PASSWORD') | default('WPUser#1', true) }}"
+
+    # Config file source directory (dynamic based on playbook location)
+    config_src_dir: "{{ playbook_dir }}/project-ansible-demo"
+
+    # Service names (for flexibility across distros)
+    mysql_service: mysqld
+    php_fpm_service: php-fpm
+    nginx_service: nginx
+    ssh_service: sshd
+
+  tasks:
+    - name: Ensure config source directory exists
+      file:
+        path: "{{ config_src_dir }}"
+        state: directory
+      check_mode: no
+      register: config_dir_check
+      failed_when: config_dir_check.failed and 'No such file or directory' in config_dir_check.msg
+
+    - name: Download and Install MySQL repository
+      yum:
+        name: https://repo.mysql.com/mysql84-community-release-el9-1.noarch.rpm
+        state: present
+        disable_gpg_check: yes
+
+    - name: Install MySQL server
+      yum:
+        name: mysql-community-server
+        state: present
+    
+    - name: Install Python and pip
+      yum:
+        name: python3-pip
+        state: present
+
+    - name: Install MySQL Python dependency
+      pip:
+        name: PyMySQL
+        executable: pip3
+        
+    - name: Enable and start MySQL service
+      systemd:
+        name: "{{ mysql_service }}"
+        enabled: yes
+        state: started
+
+    - name: Check MySQL temporary password
+      shell: grep 'temporary password' /var/log/mysqld.log | awk '{print $NF}'
+      register: mysql_temp_password
+      changed_when: false
+      failed_when: false
+
+    - name: Set MySQL root password and enable mysql_native_password
+      community.mysql.mysql_user:
+        login_user: root
+        login_password: "{{ mysql_temp_password.stdout | default('', true) }}"
+        user: root
+        password: "{{ mysql_root_password }}"
+        host: localhost
+        state: present
+        plugin: mysql_native_password
+      when: mysql_temp_password.stdout is defined and mysql_temp_password.stdout != ""
+      ignore_errors: yes
+
+    - name: Ensure MySQL uses mysql_native_password by default
+      lineinfile:
+        path: /etc/my.cnf
+        regexp: '^default_authentication_plugin'
+        line: 'default_authentication_plugin=mysql_native_password'
+        insertafter: '^\[mysqld\]'
+      notify: Restart MySQL
+
+    - name: Install PHP and required extensions
+      yum:
+        name:
+          - php
+          - php-fpm
+          - php-mysqlnd
+          - php-cli
+          - php-common
+          - php-json
+          - php-opcache
+          - php-mbstring
+          - php-xml
+          - php-curl
+        state: present
+
+    - name: Enable and start PHP-FPM
+      service:
+        name: "{{ php_fpm_service }}"
+        state: started
+        enabled: yes
+
+    - name: Install Nginx
+      yum:
+        name: "{{ nginx_service }}"
+        state: present
+
+    - name: Enable and start Nginx
+      service:
+        name: "{{ nginx_service }}"
+        enabled: yes
+        state: started
+
+    - name: Create project user
+      user:
+        name: "{{ project_user }}"
+        password: "{{ 'project' | password_hash('sha512') }}"
+
+    - name: Create project directory structure
+      file:
+        path: "{{ project_public_dir }}"
+        state: directory
+        owner: "{{ project_user }}"
+        group: "{{ project_user }}"
+        mode: '0755'
+        recurse: yes
+
+    - name: Enable SELinux HTTP home directory access
+      seboolean:
+        name: httpd_enable_homedirs
+        state: yes
+        persistent: yes
+      when: ansible_selinux.status is defined and ansible_selinux.status == "enabled"
+
+    - name: Configure Nginx project site
+      copy:
+        src: "{{ config_src_dir }}/project.conf"
+        dest: /etc/nginx/conf.d/project.conf
+      notify: Restart Nginx and PHP-FPM
+
+    - name: Configure SFTP access
+      copy:
+        src: "{{ config_src_dir }}/sftp.conf"
+        dest: /etc/ssh/sshd_config.d/sftp.conf
+      notify: Restart SSH
+
+    - name: Create SFTP user group
+      group:
+        name: "{{ sftp_group }}"
+        state: present
+
+    - name: Add project user to sftpusers and nginx groups
+      user:
+        name: "{{ project_user }}"
+        groups: [ "{{ sftp_group }}", "{{ nginx_service }}" ]
+        append: yes
+
+    - name: Set permissions for SFTP base directory
+      file:
+        path: "{{ project_base_dir }}"
+        state: directory
+        owner: root
+        group: "{{ sftp_group }}"
+        mode: '0755'
+
+    - name: Set permissions for project public directory
+      file:
+        path: "{{ project_public_dir }}"
+        state: directory
+        owner: "{{ project_user }}"
+        group: "{{ sftp_group }}"
+        mode: '0755'
+
+    - name: Download and extract phpMyAdmin
+      unarchive:
+        src: https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.tar.gz
+        dest: "{{ project_public_dir }}/"
+        remote_src: yes
+        creates: "{{ project_public_dir }}/phpmyadmin"
+
+    - name: Rename phpMyAdmin folder dynamically
+      command: mv "{{ project_public_dir }}/phpMyAdmin-*-all-languages/" "{{ project_public_dir }}/phpmyadmin/"
+      args:
+        removes: "{{ project_public_dir }}/phpMyAdmin-*-all-languages/"
+        creates: "{{ project_public_dir }}/phpmyadmin/"
+      ignore_errors: yes
+
+    - name: Configure Nginx for phpMyAdmin
+      copy:
+        src: "{{ config_src_dir }}/phpmyadmin.conf"
+        dest: /etc/nginx/conf.d/phpmyadmin.conf
+
+    - name: Restart Nginx
+      service:
+        name: "{{ nginx_service }}"
+        state: restarted
+
+    - name: Create Nginx configuration file
+      copy:
+        content: |
+          server {
+              listen 80;
+              server_name adnansal.im;
+
+              location /phpmyadmin {
+                  root /home/project/project/public;
+                  index index.php;
+                  try_files $uri $uri/ /index.php;
+              }
+
+              location ~ ^/phpmyadmin/(.+\.php)$ {
+                  root /home/project/project/public;
+                  fastcgi_pass unix:/run/php-fpm/www.sock;
+                  fastcgi_index index.php;
+                  include fastcgi.conf;
+              }
+          }
+        dest: /etc/nginx/conf.d/phpmyadmin.conf # or /etc/nginx/sites-available/phpmyadmin.conf and create a symlink.
+
+    - name: Restart Nginx
+      service:
+        name: "{{ nginx_service }}"
+        state: restarted
+
+    - name: Download and extract WordPress
+      shell: >
+        cd {{ project_public_dir }} &&
+        wget https://wordpress.org/latest.tar.gz &&
+        tar -xzf latest.tar.gz &&
+        mv wordpress/* . &&
+        rm -rf wordpress latest.tar.gz
+      args:
+        creates: "{{ project_public_dir }}/index.php"
+      ignore_errors: yes
+
+    - name: Update MySQL configuration file
+      copy:
+        src: "{{ config_src_dir }}/mysql.conf"
+        dest: /etc/my.cnf
+      notify: Restart MySQL
+
+    - name: Configure MySQL database
+      community.mysql.mysql_db:
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+        name: "{{ mysql_wp_db }}"
+        state: present
+
+    - name: Ensure MySQL uses mysql_native_password by default
+      lineinfile:
+        path: /etc/my.cnf
+        regexp: '^default_authentication_plugin'
+        line: 'default_authentication_plugin=mysql_native_password'
+        insertafter: '^\[mysqld\]'
+      notify: Restart MySQL
+
+    - name: Overwrite /etc/my.cnf
+      copy:
+        content: |
+          # For advice on how to change settings please see
+          # http://dev.mysql.com/doc/refman/8.4/en/server-configuration-defaults.html
+          [mysqld]
+          mysql_native_password=ON
+          #
+          # Remove leading # and set to the amount of RAM for the most important data
+          # cache in MySQL. Start at 70% of total RAM for dedicated server, else 10%.
+          # innodb_buffer_pool_size = 128M
+          #
+          # Remove the leading "# " to disable binary logging
+          # Binary logging captures changes between backups and is enabled by
+          # default. It's default setting is log_bin=binlog
+          # disable_log_bin
+          #
+          # Remove leading # to set options mainly useful for reporting servers.
+          # The server defaults are faster for transactions and fast SELECTs.
+          # Adjust sizes as needed, experiment to find the optimal values.
+          # join_buffer_size = 128M
+          # sort_buffer_size = 2M
+          # read_rnd_buffer_size = 2M
+
+          datadir=/var/lib/mysql
+          socket=/var/lib/mysql/mysql.sock
+
+          log-error=/var/log/mysqld.log
+          pid-file=/var/run/mysqld/mysqld.pid
+        dest: /etc/my.cnf
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Restart MySQL
+      systemd:
+        name: mysqld
+        state: restarted
+        
+
+    - name: Create WordPress user in MySQL
+      community.mysql.mysql_user:
+        login_user: root
+        login_password: "{{ mysql_root_password }}"
+        name: "{{ mysql_wp_user }}"
+        password: "{{ mysql_wp_password }}"
+        priv: "{{ mysql_wp_db }}.*:ALL"
+        host: localhost
+        state: present
+        plugin: mysql_native_password
+
+    - name: Generate wp-config.php
+      copy:
+        src: "{{ config_src_dir }}/wp-config.php"
+        dest: "{{ project_public_dir }}/wp-config.php"
+      notify: Reload Nginx
+
+  handlers:
+    - name: Restart MySQL
+      systemd:
+        name: "{{ mysql_service }}"
+        state: restarted
+
+    - name: Restart Nginx and PHP-FPM
+      service:
+        name: "{{ item }}"
+        state: restarted
+      loop:
+        - "{{ nginx_service }}"
+        - "{{ php_fpm_service }}"
+
+    - name: Restart SSH
+      systemd:
+        name: "{{ ssh_service }}"
+        state: restarted
+
+    - name: Reload Nginx
+      service:
+        name: "{{ nginx_service }}"
+        state: reloaded
