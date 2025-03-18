@@ -1,38 +1,7 @@
-- name: Dynamic playbook for project setup
-  hosts: localhost  # Can be overridden with -i or inventory
-  connection: local  # Can be adjusted for remote hosts
-  become: yes       # Ensures root privileges
-  vars:
-    # Project-specific variables
-    project_user: project
-    project_base_dir: "/home/{{ project_user }}"
-    project_public_dir: "{{ project_base_dir }}/project/public"
-    sftp_group: sftpusers
-
-    # MySQL variables
-    mysql_root_password: "{{ lookup('env', 'MYSQL_ROOT_PASSWORD') | default('Ansible#1', true) }}"
-    mysql_wp_db: wordpress
-    mysql_wp_user: wpuser
-    mysql_wp_password: "{{ lookup('env', 'MYSQL_WP_PASSWORD') | default('WPUser#1', true) }}"
-
-    # Config file source directory (dynamic based on playbook location)
-    config_src_dir: "{{ playbook_dir }}/project-ansible-demo"
-
-    # Service names (for flexibility across distros)
-    mysql_service: mysqld
-    php_fpm_service: php-fpm
-    nginx_service: nginx
-    ssh_service: sshd
-
+---
+- name: playbook for project
+  hosts: localhost
   tasks:
-    - name: Ensure config source directory exists
-      file:
-        path: "{{ config_src_dir }}"
-        state: directory
-      check_mode: no
-      register: config_dir_check
-      failed_when: config_dir_check.failed and 'No such file or directory' in config_dir_check.msg
-
     - name: Download and Install MySQL repository
       yum:
         name: https://repo.mysql.com/mysql84-community-release-el9-1.noarch.rpm
@@ -43,8 +12,8 @@
       yum:
         name: mysql-community-server
         state: present
-    
-    - name: Install Python and pip
+
+    - name: Install Python
       yum:
         name: python3-pip
         state: present
@@ -53,38 +22,34 @@
       pip:
         name: PyMySQL
         executable: pip3
-        
-    - name: Enable and start MySQL service
+
+    - name: Enable and start MySQL
       systemd:
-        name: "{{ mysql_service }}"
+        name: mysqld
         enabled: yes
         state: started
 
-    - name: Check MySQL temporary password
-      shell: grep 'temporary password' /var/log/mysqld.log | awk '{print $NF}'
-      register: mysql_temp_password
-      changed_when: false
-      failed_when: false
+    #- name: Secure MySQL installation
+    #  mysql_user:
+    #    login_user: root
+    #    login_password: "&A3uOiMOWgXw"
+    #    name: root
+    #    password: "Ansible#1"
+    #    state: present
 
-    - name: Set MySQL root password and enable mysql_native_password
-      community.mysql.mysql_user:
-        login_user: root
-        login_password: "{{ mysql_temp_password.stdout | default('', true) }}"
-        user: root
-        password: "{{ mysql_root_password }}"
-        host: localhost
-        state: present
-        plugin: mysql_native_password
-      when: mysql_temp_password.stdout is defined and mysql_temp_password.stdout != ""
-      ignore_errors: yes
+    #- name: Remove anonymous MySQL users
+    #  mysql_user:
+    #    name: ""
+    #    host_all: yes
+    #    state: absent
 
-    - name: Ensure MySQL uses mysql_native_password by default
-      lineinfile:
-        path: /etc/my.cnf
-        regexp: '^default_authentication_plugin'
-        line: 'default_authentication_plugin=mysql_native_password'
-        insertafter: '^\[mysqld\]'
-      notify: Restart MySQL
+    #- name: Remove MySQL test database
+    #  mysql_db:
+    #    name: test
+    #    state: absent
+
+    #- name: Reload MySQL privilege tables
+    #  command: mysql -u root -pAnsible#1 -e "FLUSH PRIVILEGES;"
 
     - name: Install PHP and required extensions
       yum:
@@ -103,32 +68,32 @@
 
     - name: Enable and start PHP-FPM
       service:
-        name: "{{ php_fpm_service }}"
+        name: php-fpm
         state: started
         enabled: yes
 
     - name: Install Nginx
       yum:
-        name: "{{ nginx_service }}"
+        name: nginx
         state: present
 
     - name: Enable and start Nginx
       service:
-        name: "{{ nginx_service }}"
+        name: nginx
         enabled: yes
         state: started
 
     - name: Create project user
       user:
-        name: "{{ project_user }}"
+        name: project
         password: "{{ 'project' | password_hash('sha512') }}"
 
     - name: Create project directory structure
       file:
-        path: "{{ project_public_dir }}"
+        path: /home/project/project/public
         state: directory
-        owner: "{{ project_user }}"
-        group: "{{ project_user }}"
+        owner: project
+        group: project
         mode: '0755'
         recurse: yes
 
@@ -137,135 +102,181 @@
         name: httpd_enable_homedirs
         state: yes
         persistent: yes
-      when: ansible_selinux.status is defined and ansible_selinux.status == "enabled"
 
     - name: Configure Nginx project site
       copy:
-        src: "{{ config_src_dir }}/project.conf"
         dest: /etc/nginx/conf.d/project.conf
-      notify: Restart Nginx and PHP-FPM
+        content: |
+          server {
+            listen 80;
+            server_name adnan.adnansal.im;
+
+            root /home/project/project/public;
+            index index.php index.html index.htm;
+
+            location / {
+                root /home/project/project/public;
+                index index.php;
+                try_files $uri $uri/ /index.php?$query_string;
+            }
+
+            location ~ \.php$ {
+                include fastcgi_params;
+                fastcgi_pass unix:/run/php-fpm/www.sock;
+                fastcgi_index index.php;
+                fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+            }
+
+            location ~ /\.ht {
+                deny all;
+            }
+          }
+
+    - name: Restart Nginx and PHP-FPM
+      service:
+        name: "{{ item }}"
+        state: restarted
+      loop:
+        - nginx
+        - php-fpm
 
     - name: Configure SFTP access
       copy:
-        src: "{{ config_src_dir }}/sftp.conf"
         dest: /etc/ssh/sshd_config.d/sftp.conf
-      notify: Restart SSH
+        content: |
+          Match Group sftpusers
+              ChrootDirectory %h
+              ForceCommand internal-sftp
+              AllowTcpForwarding no
+              X11Forwarding no
+              PasswordAuthentication yes
 
-    - name: Create SFTP user group
+    - name: Restart SSH service
+      systemd:
+        name: sshd
+        state: restarted
+
+    - name: Create SFTP user group and assign project user
       group:
-        name: "{{ sftp_group }}"
+        name: sftpusers
         state: present
 
-    - name: Add project user to sftpusers and nginx groups
+    - name: Add project user to sftpusers group
       user:
-        name: "{{ project_user }}"
-        groups: [ "{{ sftp_group }}", "{{ nginx_service }}" ]
+        name: project
+        groups: [ sftpusers, nginx ]
         append: yes
 
-    - name: Set permissions for SFTP base directory
+    - name: Set permissions for SFTP directories
       file:
-        path: "{{ project_base_dir }}"
+        path: /home/project
         state: directory
         owner: root
-        group: "{{ sftp_group }}"
+        group: sftpusers
         mode: '0755'
 
     - name: Set permissions for project public directory
       file:
-        path: "{{ project_public_dir }}"
+        path: /home/project/project/public
         state: directory
-        owner: "{{ project_user }}"
-        group: "{{ sftp_group }}"
+        owner: project
+        group: sftpusers
         mode: '0755'
 
     - name: Download and extract phpMyAdmin
       unarchive:
         src: https://www.phpmyadmin.net/downloads/phpMyAdmin-latest-all-languages.tar.gz
-        dest: "{{ project_public_dir }}/"
+        dest: /home/project/project/public/
         remote_src: yes
-        creates: "{{ project_public_dir }}/phpmyadmin"
+        creates: /home/project/project/public/phpmyadmin
 
-    - name: Rename phpMyAdmin folder dynamically
-      command: mv "{{ project_public_dir }}/phpMyAdmin-*-all-languages/" "{{ project_public_dir }}/phpmyadmin/"
+    - name: Rename phpmyadmin folder name
+      command: mv /home/project/project/public/phpMyAdmin-5.2.2-all-languages/ /home/project/project/public/phpmyadmin/
       args:
-        removes: "{{ project_public_dir }}/phpMyAdmin-*-all-languages/"
-        creates: "{{ project_public_dir }}/phpmyadmin/"
-      ignore_errors: yes
+        removes: /home/project/project/public/phpMyAdmin-5.2.2-all-languages/
+        creates: /home/project/project/public/phpmyadmin/
 
     - name: Configure Nginx for phpMyAdmin
       copy:
-        src: "{{ config_src_dir }}/phpmyadmin.conf"
         dest: /etc/nginx/conf.d/phpmyadmin.conf
-
-    - name: Restart Nginx
-      service:
-        name: "{{ nginx_service }}"
-        state: restarted
-
-    - name: Create Nginx configuration file
-      copy:
         content: |
           server {
-              listen 80;
-              server_name adnansal.im;
+            listen 80;
+            server_name adnan.adnansal.im;
 
-              location /phpmyadmin {
-                  root /home/project/project/public;
-                  index index.php;
-                  try_files $uri $uri/ /index.php;
-              }
+            location /phpmyadmin {
+                root /home/project/project/public;
+                index index.php;
+                try_files $uri $uri/ /index.php;
+            }
 
-              location ~ ^/phpmyadmin/(.+\.php)$ {
-                  root /home/project/project/public;
-                  fastcgi_pass unix:/run/php-fpm/www.sock;
-                  fastcgi_index index.php;
-                  include fastcgi.conf;
-              }
+            location ~ ^/phpmyadmin/(.+\.php)$ {
+                root /home/project/project/public;
+                fastcgi_pass unix:/run/php-fpm/www.sock;
+                fastcgi_index index.php;
+                include fastcgi.conf;
+            }
           }
-        dest: /etc/nginx/conf.d/phpmyadmin.conf # or /etc/nginx/sites-available/phpmyadmin.conf and create a symlink.
 
     - name: Restart Nginx
-      service:
-        name: "{{ nginx_service }}"
+      systemd:
+        name: nginx
         state: restarted
+
+    - name: Get Public IP of the Server
+      shell: "curl -s http://checkip.amazonaws.com"
+      register: public_ip
+      changed_when: false
+
+    - name: Replace IP in Nginx config
+      lineinfile:
+        path: /etc/nginx/conf.d/project.conf
+        regexp: '^\s*server_name\s+.*;$'
+        line: "    server_name {{ public_ip.stdout }};"
+
+    - name: Restart Nginx
+      systemd:
+        name: nginx
+        state: restarted
+
+
+
+    #- name: Download and extract WordPress
+    #  unarchive:
+    #    src: https://wordpress.org/latest.tar.gz
+    #    dest: /home/project/project/public/
+    #    remote_src: yes
+    #    extra_opts:
+    #      - --strip-components=1
+    #    creates: /home/project/project/public/index.php
+    #  ignore_errors: yes
 
     - name: Download and extract WordPress
       shell: >
-        cd {{ project_public_dir }} &&
+        cd /home/project/project/public/ &&
         wget https://wordpress.org/latest.tar.gz &&
         tar -xzf latest.tar.gz &&
         mv wordpress/* . &&
-        rm -rf wordpress latest.tar.gz
+        rm -rf wordpress latest.tar.gz wp-config-sample.php
       args:
-        creates: "{{ project_public_dir }}/index.php"
-      ignore_errors: yes
+        creates: /home/project/project/public/index.php
 
-    - name: Update MySQL configuration file
+    - name: Change file permissions
+      file:
+        path: /home/project/project/public
+        state: directory
+        owner: project
+        group: project
+        mode: '0755'
+        recurse: yes
+
+    - name: Update mysql configuration file
       copy:
-        src: "{{ config_src_dir }}/mysql.conf"
         dest: /etc/my.cnf
-      notify: Restart MySQL
-
-    - name: Configure MySQL database
-      community.mysql.mysql_db:
-        login_user: root
-        login_password: "{{ mysql_root_password }}"
-        name: "{{ mysql_wp_db }}"
-        state: present
-
-    - name: Ensure MySQL uses mysql_native_password by default
-      lineinfile:
-        path: /etc/my.cnf
-        regexp: '^default_authentication_plugin'
-        line: 'default_authentication_plugin=mysql_native_password'
-        insertafter: '^\[mysqld\]'
-      notify: Restart MySQL
-
-    - name: Overwrite /etc/my.cnf
-      copy:
         content: |
           # For advice on how to change settings please see
           # http://dev.mysql.com/doc/refman/8.4/en/server-configuration-defaults.html
+
           [mysqld]
           mysql_native_password=ON
           #
@@ -290,54 +301,169 @@
 
           log-error=/var/log/mysqld.log
           pid-file=/var/run/mysqld/mysqld.pid
-        dest: /etc/my.cnf
-        owner: root
-        group: root
-        mode: '0644'
 
-    - name: Restart MySQL
-      systemd:
+    - name: Restart mysqld
+      service:
         name: mysqld
         state: restarted
-        
+
+    - name: Get MySQL temporary root password
+      shell: sudo grep 'temporary password' /var/log/mysqld.log | awk '{print $NF}'
+      register: mysql_temp_password
+      changed_when: false
+
+    - name: Update MySQL root password
+      shell: >
+        mysqladmin --user=root --password="{{ mysql_temp_password.stdout }}"
+        password "Ansible#1"
+      ignore_errors: yes
+
+    - name: Configure MySQL database and user
+      community.mysql.mysql_db:
+        login_user: root
+        login_password: "Ansible#1"
+        name: wordpress
+        state: present
 
     - name: Create WordPress user in MySQL
       community.mysql.mysql_user:
         login_user: root
-        login_password: "{{ mysql_root_password }}"
-        name: "{{ mysql_wp_user }}"
-        password: "{{ mysql_wp_password }}"
-        priv: "{{ mysql_wp_db }}.*:ALL"
+        login_password: "Ansible#1"
+        name: wpuser
+        password: "WPUser#1"
+        priv: 'wordpress.*:ALL'
         host: localhost
         state: present
-        plugin: mysql_native_password
+
+    - name: Restart Nginx
+      systemd:
+        name: nginx
+        state: restarted
+
+    - name: Fetch random salts for WordPress config
+      command: curl https://api.wordpress.org/secret-key/1.1/salt/
+      register: "wp_salt"
 
     - name: Generate wp-config.php
       copy:
-        src: "{{ config_src_dir }}/wp-config.php"
-        dest: "{{ project_public_dir }}/wp-config.php"
-      notify: Reload Nginx
+        dest: /home/project/project/public/wp-config.php
+        content: |
+          <?php
+          /**
+            * The base configuration for WordPress
+            *
+            * The wp-config.php creation script uses this file during the installation.
+            * You don't have to use the website, you can copy this file to "wp-config.php"
+            * and fill in the values.
+            *
+            * This file contains the following configurations:
+            *
+            * * Database settings
+            * * Secret keys
+            * * Database table prefix
+            * * ABSPATH
+            *
+            * @link https://developer.wordpress.org/advanced-administration/wordpress/wp-config/
+            *
+            * @package WordPress
+            */
 
-  handlers:
-    - name: Restart MySQL
-      systemd:
-        name: "{{ mysql_service }}"
-        state: restarted
+          // ** Database settings - You can get this info from your web host ** //
+          /** The name of the database for WordPress */
+          define( 'DB_NAME', 'wordpress' );
 
-    - name: Restart Nginx and PHP-FPM
+          /** Database username */
+          define( 'DB_USER', 'wpuser' );
+
+          /** Database password */
+          define( 'DB_PASSWORD', 'WPUser#1' );
+
+          /** Database hostname */
+          define( 'DB_HOST', 'localhost' );
+
+          /** Database charset to use in creating database tables. */
+          define( 'DB_CHARSET', 'utf8mb4' );
+
+          /** The database collate type. Don't change this if in doubt. */
+          define( 'DB_COLLATE', '' );
+
+          /**#@+
+            * Authentication unique keys and salts.
+            *
+            * Change these to different unique phrases! You can generate these using
+            * the {@link https://api.wordpress.org/secret-key/1.1/salt/ WordPress.org secret-key service}.
+            *
+            * You can change these at any point in time to invalidate all existing cookies.
+            * This will force all users to have to log in again.
+            *
+            * @since 2.6.0
+            */
+
+          {{ wp_salt.stdout }}
+
+          /**#@-*/
+
+          /**
+            * WordPress database table prefix.
+            *
+            * You can have multiple installations in one database if you give each
+            * a unique prefix. Only numbers, letters, and underscores please!
+            *
+            * At the installation time, database tables are created with the specified prefix.
+            * Changing this value after WordPress is installed will make your site think
+            * it has not been installed.
+            *
+            * @link https://developer.wordpress.org/advanced-administration/wordpress/wp-config/#table-prefix
+            */
+          $table_prefix = 'wp_';
+
+          /**
+            * For developers: WordPress debugging mode.
+            *
+            * Change this to true to enable the display of notices during development.
+            * It is strongly recommended that plugin and theme developers use WP_DEBUG
+            * in their development environments.
+            *
+            * For information on other constants that can be used for debugging,
+            * visit the documentation.
+            *
+            * @link https://developer.wordpress.org/advanced-administration/debug/debug-wordpress/
+            */
+          define( 'WP_DEBUG', false );
+
+          /* Add any custom values between this line and the "stop editing" line. */
+
+
+
+          /* That's all, stop editing! Happy publishing. */
+
+          /** Absolute path to the WordPress directory. */
+          if ( ! defined( 'ABSPATH' ) ) {
+              define( 'ABSPATH', __DIR__ . '/' );
+          }
+
+          /** Sets up WordPress vars and included files. */
+          require_once ABSPATH . 'wp-settings.php';
+        owner: project
+        group: project
+
+    - name: Reload nginx
       service:
-        name: "{{ item }}"
-        state: restarted
-      loop:
-        - "{{ nginx_service }}"
-        - "{{ php_fpm_service }}"
-
-    - name: Restart SSH
-      systemd:
-        name: "{{ ssh_service }}"
-        state: restarted
-
-    - name: Reload Nginx
-      service:
-        name: "{{ nginx_service }}"
+        name: nginx
         state: reloaded
+
+    - name: Restart nginx
+      service:
+        name: nginx
+        state: restarted
+
+    #- name: Install Certbot
+    #  yum:
+    #    name: "{{ item }}"
+    #    state: present
+    #  loop:
+    #    - certbot
+    #    - python3-certbot-nginx
+
+    #- name: Generate SSL Certificate using Let's Encrypt
+    #  command: certbot --nginx -d adnan.adnansal.im --agree-tos --email adnanzabdi@outlook.com --non-interactive
