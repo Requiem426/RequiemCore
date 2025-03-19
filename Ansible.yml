@@ -68,32 +68,6 @@
         state: yes
         persistent: yes
 
-    - name: Configure Nginx for WordPress
-      copy:
-        dest: /etc/nginx/conf.d/project.conf
-        content: |
-          server {
-            listen 80;
-            server_name adnan.adnansal.im;
-
-            root /home/project/project/public;
-            index index.php index.html;
-
-            location / {
-                try_files $uri $uri/ /index.php?$query_string;
-            }
-
-            location ~ \.php$ {
-                include fastcgi_params;
-                fastcgi_pass unix:/run/php-fpm/www.sock;
-                fastcgi_index index.php;
-                fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
-            }
-
-            location ~ /\.ht {
-                deny all;
-            }
-          }
 
     - name: Configure SFTP access
       copy:
@@ -140,27 +114,59 @@
       args:
         creates: /home/project/project/public/phpmyadmin
 
-    - name: Configure Nginx for phpMyAdmin
+
+    - name: Configure Nginx for WordPress and phpMyAdmin
       copy:
-        dest: /etc/nginx/conf.d/phpmyadmin.conf
+        dest: /etc/nginx/conf.d/project.conf
         content: |
           server {
-            listen 80;
-            server_name adnan.adnansal.im;
+              listen 80;
+              server_name adnan.adnansal.im;
 
-            location /phpmyadmin {
-                root /home/project/project/public;
-                index index.php;
-                try_files $uri $uri/ /index.php;
-            }
+              root /home/project/project/public;
+              index index.php index.html;
 
-            location ~ ^/phpmyadmin/(.+\.php)$ {
-                root /home/project/project/public;
-                fastcgi_pass unix:/run/php-fpm/www.sock;
-                fastcgi_index index.php;
-                include fastcgi.conf;
-            }
+              # WordPress configuration
+              location / {
+                  try_files $uri $uri/ /index.php?$query_string;
+              }
+    
+              location ~ \.php$ {
+                  include fastcgi_params;
+                  fastcgi_pass unix:/run/php-fpm/www.sock;
+                  fastcgi_index index.php;
+                  fastcgi_param SCRIPT_FILENAME $document_root$fastcgi_script_name;
+             }
+
+              location ~ /\.ht {
+                  deny all;
+             }
+
+              # phpMyAdmin configuration
+             location /phpmyadmin {
+                  root /home/project/project/public;
+                  index index.php;
+                 try_files $uri $uri/ /index.php;
+             }
+
+             location ~ ^/phpmyadmin/(.+\.php)$ {
+                  root /home/project/project/public;
+                  fastcgi_pass unix:/run/php-fpm/www.sock;
+                  fastcgi_index index.php;
+                  include fastcgi.conf;
+             }
           }
+
+    - name: Remove the separate phpMyAdmin Nginx config (if it exists)
+      file:
+        path: /etc/nginx/conf.d/phpmyadmin.conf
+        state: absent
+
+    - name: Reload Nginx
+      systemd:
+        name: nginx
+        state: reloaded
+
 
     - name: Restart Nginx
       systemd:
@@ -266,4 +272,66 @@
         - nginx
         - php-fpm
         - mysqld
+
+    - name: Install WP-CLI
+      get_url:
+        url: https://raw.githubusercontent.com/wp-cli/builds/gh-pages/phar/wp-cli.phar
+        dest: /usr/local/bin/wp
+        mode: '0755'
+
+    - name: Forcefully install WordPress if not installed
+      shell: >
+        /usr/local/bin/wp core install
+        --path="/home/project/project/public"
+        --url="http://{{ ansible_default_ipv4.address }}"
+        --title="My WordPress Site"
+        --admin_user="admin"
+        --admin_password="StrongPassword123!"
+        --admin_email="admin@example.com"
+        --allow-root
+      become: yes
+      environment:
+        WP_CLI_HOST: "{{ ansible_default_ipv4.address }}"
+      when: wp_installed.rc != 0
+
+
+    - name: Display WordPress tables
+      debug:
+        var: db_tables.stdout_lines
+
+
+    - name: Perform WordPress installation using WP-CLI
+      shell: >
+        /usr/local/bin/wp core install
+        --path="/home/project/project/public"
+        --url="http://{{ ansible_default_ipv4.address }}"
+        --title="My WordPress Site"
+        --admin_user="admin"
+        --admin_password="StrongPassword123!"
+        --admin_email="admin@example.com"
+        --allow-root
+      args:
+        creates: "/home/project/project/public/wp-config.php"
+      become: yes
+      environment:
+        WP_CLI_HOST: "{{ ansible_default_ipv4.address }}"
+      when: wp_installed.rc == 0
+
+    - name: Secure WordPress installation
+      command: >
+        /usr/local/bin/wp option update blog_public 0
+        --path="/home/project/project/public"
+        --allow-root
+      environment:
+        WP_CLI_HOST: "{{ ansible_default_ipv4.address }}"
+
+
+    - name: Set proper ownership and permissions
+      file:
+        path: /home/project/project/public
+        state: directory
+        owner: www-data
+        group: www-data
+        mode: '0755'
+        recurse: yes
 
