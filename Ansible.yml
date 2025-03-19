@@ -46,6 +46,12 @@
         name: project
         state: present
 
+    - name: Ensure the 'sftpusers' group exists
+      group:
+        name: sftpusers
+        state: present
+
+
     - name: Create project user and group
       user:
         name: project
@@ -279,7 +285,15 @@
         dest: /usr/local/bin/wp
         mode: '0755'
 
-    - name: Forcefully install WordPress if not installed
+
+    - name: Check if WordPress is already installed
+      shell: >
+        /usr/local/bin/wp core is-installed --path="/home/project/project/public" --allow-root
+      register: wp_installed
+      failed_when: false
+      changed_when: false
+
+    - name: Install WordPress using WP-CLI (if not installed)
       shell: >
         /usr/local/bin/wp core install
         --path="/home/project/project/public"
@@ -289,33 +303,12 @@
         --admin_password="StrongPassword123!"
         --admin_email="admin@example.com"
         --allow-root
-      become: yes
-      environment:
-        WP_CLI_HOST: "{{ ansible_default_ipv4.address }}"
       when: wp_installed.rc != 0
 
 
     - name: Display WordPress tables
       debug:
         var: db_tables.stdout_lines
-
-
-    - name: Perform WordPress installation using WP-CLI
-      shell: >
-        /usr/local/bin/wp core install
-        --path="/home/project/project/public"
-        --url="http://{{ ansible_default_ipv4.address }}"
-        --title="My WordPress Site"
-        --admin_user="admin"
-        --admin_password="StrongPassword123!"
-        --admin_email="admin@example.com"
-        --allow-root
-      args:
-        creates: "/home/project/project/public/wp-config.php"
-      become: yes
-      environment:
-        WP_CLI_HOST: "{{ ansible_default_ipv4.address }}"
-      when: wp_installed.rc == 0
 
     - name: Secure WordPress installation
       command: >
@@ -325,13 +318,105 @@
       environment:
         WP_CLI_HOST: "{{ ansible_default_ipv4.address }}"
 
-
     - name: Set proper ownership and permissions
       file:
         path: /home/project/project/public
         state: directory
-        owner: www-data
-        group: www-data
+        owner: nginx
+        group: nginx
         mode: '0755'
         recurse: yes
+
+
+    - name: Fix file permissions for WordPress
+      ansible.builtin.shell: |
+        chown -R nginx:nginx /home/project/project/public
+        find /home/project/project/public -type d -exec chmod 755 {} \;
+        find /home/project/project/public -type f -exec chmod 644 {} \;
+      become: yes
+
+    - name: Find WordPress NGINX config file
+      find:
+        paths: /etc/nginx/conf.d
+        patterns: "project.conf"
+      register: nginx_conf
+
+    - name: Ensure NGINX serves static files
+      lineinfile:
+        path: "{{ nginx_conf.files[0].path }}"
+        line: 'location ~* \.(?:ico|css|js|gif|jpe?g|png|woff2?|eot|ttf|otf|svg)$ { expires 6M; access_log off; add_header Cache-Control "public, max-age=15552000"; }'
+        insertafter: "server_name .*;"
+        state: present
+      when: nginx_conf.matched > 0
+
+
+
+    - name: Restart NGINX and PHP-FPM
+      ansible.builtin.service:
+        name: "{{ item }}"
+        state: restarted
+      with_items:
+        - nginx
+        - php-fpm
+
+
+- name: Install Certbot and obtain SSL certificate
+  hosts: localhost
+  become: yes
+  tasks:
+    - name: Install Certbot, NGINX plugin, and Cron
+      yum:
+        name:
+          - certbot
+          - python3-certbot-nginx
+          - cronie  # Install cron
+        state: present
+
+    - name: Enable and start cron service
+      systemd:
+        name: crond
+        enabled: yes
+        state: started
+
+    - name: Obtain SSL certificate
+      command: >
+        certbot certonly --nginx --non-interactive
+        --agree-tos
+        --email sarangpopinz@gmail.com
+        -d sarang.adnansal.im
+      args:
+        creates: /etc/letsencrypt/live/sarang.adnansal.im/fullchain.pem
+
+    - name: Configure NGINX with SSL
+      lineinfile:
+        path: "{{ nginx_conf.files[0].path }}"
+        regexp: '^(\s*listen\s+80;)'
+        line: '    listen 443 ssl;'
+      when: nginx_conf.matched > 0
+
+    - name: Add SSL certificate configuration
+      blockinfile:
+        path: "{{ nginx_conf.files[0].path }}"
+        block: |
+          ssl_certificate /etc/letsencrypt/live/sarang.adnansal.im/fullchain.pem;
+          ssl_certificate_key /etc/letsencrypt/live/sarang.adnansal.im/privkey.pem;
+          ssl_protocols TLSv1.2 TLSv1.3;
+          ssl_prefer_server_ciphers on;
+          ssl_ciphers "EECDH+AESGCM:EDH+AESGCM:AES256+EECDH:AES256+EDH";
+      when: nginx_conf.matched > 0
+
+    - name: Enable automatic SSL certificate renewal
+      cron:
+        name: "Certbot Auto Renewal"
+        job: "certbot renew --quiet && systemctl reload nginx"
+        minute: "0"
+        hour: "3"
+        state: present
+
+    - name: Restart NGINX
+      service:
+        name: nginx
+        state: restarted
+
+
 
