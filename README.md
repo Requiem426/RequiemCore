@@ -1,6 +1,5 @@
 # Welcome to My GitHub Repository 🌐✨
 
-About
 Welcome to my repo—a 404 page with big dreams. Right now, it’s as empty as Zuckerberg’s personality, but soon it’ll be packed with enough code to make Elon tweet about it.
 
 Think of this place as:
