@@ -420,3 +420,27 @@
 
 
 
+    - name: Set WordPress site and home URLs
+      shell: |
+        wp option update siteurl "https://sarang.adnansal.im" --allow-root
+        wp option update home "https://sarang.adnansal.im" --allow-root
+      args:
+        chdir: /home/project/project/public/
+      become: yes
+
+    - name: Clear WordPress cache
+      shell: wp cache flush --allow-root
+      args:
+        chdir: /home/project/project/public/
+      become: yes
+
+    - name: Restart NGINX and PHP-FPM
+      systemd:
+        name: "{{ item }}"
+        state: restarted
+      with_items:
+        - nginx
+        - php-fpm
+      become: yes
+
+
